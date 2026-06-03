@@ -206,7 +206,7 @@ if page.startswith('1.'):
     st.subheader('Per-section status')
     st.dataframe(
         section_view.style
-            .applymap(colour_status, subset=['status'])
+            .map(colour_status, subset=['status'])
             .format({'mean_conf': '{:.2f}'}),
         use_container_width=True,
         height=420,
