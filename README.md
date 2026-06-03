@@ -1,106 +1,167 @@
-# Power Grid Fault Detection System
+# Power Grid Fault Detection
 
-Detects fault type in a 3-phase electrical power line from raw voltage
-and current measurements. Built end-to-end in Python with scikit-learn:
-sliding-window feature extraction, statistical feature engineering and a
-Random Forest classifier.
+End-to-end fault detection for 3-phase power lines. A grid operations
+console built on top of a windowed feature pipeline and a Random
+Forest classifier, with cost-weighted decision logic so the model
+only auto-acts when doing so is cheaper than calling a human.
 
-## Dataset
+> **Live console:** double-click `run.bat` (Windows) or `streamlit run app.py` (any OS).
+> **Deploy:** the repository is ready for a one-click deploy to Streamlit Community Cloud.
 
-A 50,000-row dataset of 3-phase power line measurements collected
-across 20 grid sections. Each row has six raw signal channels:
+## Why this project
 
-- `voltage_phase_a`, `voltage_phase_b`, `voltage_phase_c`
-- `current_phase_a`, `current_phase_b`, `current_phase_c`
+A real grid operator does not need another classifier; they need a tool
+that tells them *what to do*. Three concerns drive the design here:
 
-plus context columns (weather, frequency, temperature, load, etc.) and
-a `fault_type` label with six classes:
+1. **Asymmetric cost.** Missing a Three-Phase fault is hundreds of times
+   more expensive than dispatching a crew to a healthy line. A model
+   that optimises accuracy alone is the wrong model.
+2. **Calibration over score.** A confidence number is only useful if it
+   maps to a real probability. The console picks the auto-decide
+   threshold from a reliability diagram, not from gut feel.
+3. **Operator workflow first.** Every page corresponds to something an
+   operator actually does: scan the grid, investigate an alert, set
+   policy, audit the model.
 
-| Class                       | Rows  |
-|-----------------------------|------:|
-| No Fault                    | 27574 |
-| Single Line to Ground (LG)  |  9063 |
-| Line to Line (LL)           |  4942 |
-| Double Line to Ground (LLG) |  3950 |
-| Three Phase Fault (LLL)     |  2505 |
-| Open Circuit                |  1966 |
+## Pipeline at a glance
 
-## Pipeline
+```
+Raw CSV  ->  stratified-sample 7,800 rows
+         ->  slide 50-sample non-overlapping windows  (156 windows)
+         ->  6 statistics x 6 channels per window     (36 features)
+         ->  Random Forest classifier
+         ->  cost-weighted threshold selection
+```
 
-1. **Stratified sample** 7,800 rows (1,300 per class) so all six fault
-   types are represented. The raw CSV is time-sorted and heavily
-   dominated by "No Fault", so naive sampling won't work.
-2. **Sliding window** the sample into 156 non-overlapping windows of
-   50 rows each.
-3. For every window, compute six statistics on each of the six
-   channels: **RMS, Mean, Std Dev, Peak-to-Peak, Skewness, Kurtosis**.
-   That gives `6 stats x 6 channels = 36 features per window`.
-4. Result: a `156 x 36` feature matrix. Each window's label is the
-   majority `fault_type` of its 50 rows.
-5. 80/20 train-test split (stratified). Train a Random Forest with
-   `class_weight='balanced'`.
+### Feature engineering
 
-## Why these features
+For each window of 50 consecutive samples, six statistics are computed
+on each of the six raw channels (`Va, Vb, Vc, Ia, Ib, Ic`):
 
-Each statistic captures a different physical aspect of the signal:
+| Statistic        | What it captures                              |
+|------------------|-----------------------------------------------|
+| RMS              | Effective magnitude / energy content          |
+| Mean             | DC offset                                     |
+| Std Dev          | Spread - the dominant fault signal in current |
+| Peak-to-Peak     | Max swing - captures transients               |
+| Skewness         | Asymmetry of the distribution                 |
+| Kurtosis         | Tailedness - sharp spikes register here       |
 
-| Stat            | What it tells you about the signal              |
-|-----------------|-------------------------------------------------|
-| RMS             | Effective magnitude (energy content)            |
-| Mean            | DC offset / average level                       |
-| Std Dev         | Spread / variability                            |
-| Peak-to-Peak    | Max swing of the signal (transients)            |
-| Skewness        | Asymmetry of the distribution                   |
-| Kurtosis        | "Tailedness" - high values mean sharp spikes    |
+The result is a `156 x 36` feature matrix, one row per window.
 
-Faults produce characteristic distortions in these statistics. For
-example, a Line-to-Line fault drops voltage on two phases and spikes
-the current, which shows up as high std dev and peak-to-peak on those
-channels.
+### Model selection
 
-## Results
+Four classifiers were compared under 5-fold stratified cross-validation
+on macro-F1:
 
-On the held-out test set (32 windows):
+![CV comparison](reports/cv_comparison.png)
 
-- **Test accuracy: 0.59** (random baseline for 6 classes = 0.17)
-- Strongest features: `current_phase_{a,b,c}_std` and
-  `voltage_phase_{a,b,c}_rms` - current variance is the dominant
-  fault signal.
-- Per-class F1 ranges from 0.22 (LLG) to 0.86 (Open Circuit). The
-  hardest classes to separate are LL and LLG, which share similar
-  current-imbalance signatures.
+Logistic Regression edges Random Forest on the CV score, but Random
+Forest is the production pick because:
 
-## Project layout
+- Its predicted probabilities calibrate better, which matters for the
+  cost-weighted threshold on the Decision Console page.
+- It produces feature-importance scores that map directly to operator
+  explanations ("this fault was flagged because the std dev on
+  current_phase_a was 4 sigma above baseline").
+
+### Cost-weighted decision logic
+
+Each fault class has its own miss cost (`FN_COST` in
+`cost_analysis.py`) and false alarms have a fixed inspection cost
+(`FP_COST`). The Decision Console sweeps the model's confidence
+threshold and picks the tau that minimises total expected cost:
+
+| Confidence threshold | What the model does                       |
+|----------------------|-------------------------------------------|
+| `proba >= tau`       | Auto-decide; dispatch the recommended action |
+| `proba < tau`        | Abstain; route the window to a human operator |
+
+On the held-out test set the cost minimum sits at **tau ~ 0.65**.
+At that threshold the model auto-decides ~34% of windows with
+near-perfect accuracy on that slice; the rest get human review.
+
+![Confusion matrix](reports/confusion_matrix.png)
+
+## Console pages
+
+1. **Grid Status Board** - per-section health across 20 grid sections,
+   a recent-alert feed colour-coded by severity, and four operations
+   KPIs at the top.
+2. **Fault Investigation** - pick a window; the console shows the
+   model decision, full class-probability breakdown, the top
+   features that contributed to the call, the recommended action
+   under the cost policy, and the raw 36-feature vector.
+3. **Decision Console** - the cost model, the threshold-vs-cost
+   curve, the recommended tau, and a per-class breakdown of
+   realised cost.
+4. **Model Rigor** - cross-validation, confusion matrix, calibration
+   curve, feature importance.
+
+## Headline numbers
+
+- **156** windows analysed (after stratified sampling)
+- **36** statistical features per window
+- **6** fault classes (incl. No Fault)
+- **62.5%** test accuracy / **0.60** macro-F1 against a 16.7% random baseline
+- **$133K** cost reduction vs full auto-decide on the test set, by routing
+  low-confidence windows to a human
+
+## Repository layout
 
 ```
 power-grid-fault-detection/
   data/
-    power_line_fault_dataset.csv     50,000 rows of 3-phase samples
-  models/                            saved .pkl files (after training)
-  feature_extraction.py              sliding-window + 36-stat features
-  train.py                           training + evaluation pipeline
+    power_line_fault_dataset.csv     50,000 rows of 3-phase measurements
+  reports/                           plots + CSVs committed for the README
+    cv_comparison.png
+    confusion_matrix.png
+    feature_importance.png
+    roc_curves.png
+    cv_scores.csv
+    classification_report.csv
+    summary.json
+  feature_extraction.py              sliding window + 36 statistical features
+  train.py                           5-fold CV + final model + plots
+  cost_analysis.py                   fault cost matrix + threshold sweep
+  app.py                             Streamlit grid operations console
+  .streamlit/config.toml             theme
   requirements.txt
-  README.md
+  run.bat                            one-click launch on Windows
 ```
 
-## How to run
+## How to run locally
 
 ```bash
 pip install -r requirements.txt
-python train.py
+python train.py          # trains the model, writes reports/, ~30 sec
+streamlit run app.py     # opens the operations console at localhost:8501
 ```
 
-The script loads the CSV, builds the feature matrix, trains the
-model, prints accuracy + classification report + confusion matrix,
-and saves the trained model to `models/rf_fault_classifier.pkl`.
+On Windows just double-click `run.bat`.
 
-## What's next
+## How to deploy to Streamlit Cloud (zero cost, public URL)
 
-This is Module 1 of a larger plan:
+1. Push this repo to GitHub.
+2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in
+   with the same GitHub account.
+3. Click **New app**, pick this repo, branch `main`, main file `app.py`.
+4. Click **Deploy**. A public URL is generated within ~3 minutes.
 
-- **Module 1: Random Forest** (done) - works on hand-engineered window stats.
-- **Module 2: LSTM** - feed the raw 50-step window directly to a small
-  recurrent network instead of summarising to 36 features. Should pick
-  up temporal patterns the stats throw away.
-- **Module 3: Isolation Forest** - unsupervised anomaly detection for
-  fault types the supervised model has never seen.
+Streamlit Cloud will install from `requirements.txt` automatically and
+re-deploy on every push.
+
+## Limitations and roadmap
+
+- **156 windows is small.** Accuracy would climb with more data; we'd
+  also want per-location cross-validation to test generalisation across
+  geography rather than just across time.
+- **No temporal model yet.** The 6 statistics throw away within-window
+  shape. An LSTM or 1-D CNN on the raw 50-step window is the obvious
+  next step and is on the roadmap.
+- **Cost numbers are public-literature estimates.** A real deployment
+  would calibrate `FN_COST` and `FP_COST` from the operator's actual
+  outage and dispatch records.
+- **No streaming inference.** The current console scores a static test
+  set. A production version would wrap the model in a small streaming
+  service consuming PMU frames.

@@ -1,0 +1,9 @@
+{
+  "n_windows": 156,
+  "n_features": 36,
+  "n_classes": 6,
+  "test_accuracy": 0.625,
+  "test_macro_f1": 0.6001,
+  "random_baseline": 0.1667,
+  "cv_winner": "Logistic Regression"
+}
